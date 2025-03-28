@@ -4,6 +4,9 @@ import plotly.graph_objects as go
 from datetime import datetime
 from utils import img_to_html
 from pathlib import Path
+from google.cloud import storage
+import io
+import os
 # Comment out Gemini import
 # from gemini_helper import get_gemini_response, model_context
 
@@ -16,6 +19,10 @@ st.set_page_config(
 # Define paths
 STATIC_DIR = Path("static")
 IMAGES_DIR = STATIC_DIR / "images"
+
+# Google Cloud Storage configuration
+BUCKET_NAME = os.getenv('GCS_BUCKET_NAME', 'your-bucket-name')
+DATA_FILE_PATH = os.getenv('GCS_DATA_FILE_PATH', 'forecasting_dataset.csv')
 
 # Update CSS to include logo styling
 st.markdown("""
@@ -104,75 +111,215 @@ with header_col3:
 # Add a separator
 st.markdown("<hr style='margin: 1em 0; border-top: 2px solid #E5E5E5;'>", unsafe_allow_html=True)
 
-# Load data
-@st.cache_data
+# Load data from Google Cloud Storage
+@st.cache_data(ttl=3600)  # Cache for 1 hour
 def load_data():
-    df = pd.read_csv('forecasting_dataset.csv')
-    df['Date'] = pd.to_datetime(df['Date'])
-    return df
+    try:
+        # Initialize Google Cloud Storage client
+        storage_client = storage.Client()
+        
+        # Get bucket and blob
+        bucket = storage_client.bucket(BUCKET_NAME)
+        blob = bucket.blob(DATA_FILE_PATH)
+        
+        # Download the content
+        content = blob.download_as_string()
+        
+        # Read CSV from the downloaded content
+        df = pd.read_csv(io.BytesIO(content))
+        df['Date'] = pd.to_datetime(df['Date'])
+        
+        return df
+    except Exception as e:
+        st.error(f"Error loading data from Google Cloud Storage: {str(e)}")
+        # Optionally, you could return a sample dataset or raise the error
+        raise e
 
-df = load_data()
+# Add error handling around data loading
+try:
+    df = load_data()
+except Exception as e:
+    st.error("Failed to load data. Please check your Google Cloud Storage configuration.")
+    st.stop()
+
+# Add controls for showing/hiding lumber types
+st.markdown('<p class="subtitle">Forecast Controls</p>', unsafe_allow_html=True)
+control_col1, control_col2 = st.columns(2)
+
+with control_col1:
+    show_standard = st.checkbox('Show Standard Lumber', value=True)
+with control_col2:
+    show_fancy = st.checkbox('Show Fancy Lumber', value=True)
 
 # Create the interactive plot
 def create_forecast_plot():
     # Create figure
     fig = go.Figure()
 
-    # Add historical data
-    fig.add_trace(
-        go.Scatter(
-            x=df['Date'],
-            y=df['Target'],
-            name='Historical',
-            line=dict(color='#1A1A1A'),  # CN Black
-            hovertemplate='<b>Date</b>: %{x}<br>' +
-                         '<b>Value</b>: %{y:.2f}<br><extra></extra>'
-        )
-    )
+    # Calculate the date range for the last year plus forecast
+    last_year_start = df['Date'].max() - pd.DateOffset(years=1)
+    df_last_year = df[df['Date'] >= last_year_start].copy()
 
-    # Add forecast data
-    forecast_df = df[df['Target_Forecast'].notna()]
-    
-    # Get previous year values for forecast period
-    prev_year_values = {}
-    for date in forecast_df['Date']:
-        prev_year_date = date - pd.DateOffset(years=1)
-        prev_year_value = df[df['Date'] == prev_year_date]['Target'].values
-        if len(prev_year_value) > 0:
-            prev_year_values[date] = prev_year_value[0]
-
-    # Create hover text for forecast points
-    hover_text = []
-    for idx, row in forecast_df.iterrows():
-        attribution_scores = {
-            f"Indicator_{i}": row[f'Attribution_Indicator_{i}']
-            for i in range(1, 7)
-        }
-        top_3 = dict(sorted(attribution_scores.items(), key=lambda x: x[1], reverse=True)[:3])
+    if show_standard:
+        # Add bars for previous year's data
+        prev_year_data = []
+        prev_year_dates = []
+        current_dates = df_last_year['Date'].tolist()
         
-        hover_str = f"<b>Date</b>: {row['Date'].strftime('%Y-%m-%d')}<br>"
-        hover_str += f"<b>Forecast</b>: {row['Target_Forecast']:.2f}<br>"
-        hover_str += f"<b>Previous Year</b>: {prev_year_values.get(row['Date'], 'N/A'):.2f}<br>"
-        hover_str += "<b>Top 3 Features:</b><br>"
-        for feature, score in top_3.items():
-            hover_str += f"- {feature}: {score:.3f}<br>"
-        hover_text.append(hover_str)
+        for date in current_dates:
+            prev_year_date = date - pd.DateOffset(years=1)
+            prev_year_value = df[df['Date'] == prev_year_date]['Lumber'].values
+            if len(prev_year_value) > 0:
+                prev_year_data.append(prev_year_value[0])
+                prev_year_dates.append(date)
 
-    fig.add_trace(
-        go.Scatter(
-            x=forecast_df['Date'],
-            y=forecast_df['Target_Forecast'],
-            name='Forecast',
-            line=dict(color='#CC0033', dash='dash'),  # CN Red
-            hovertemplate='%{customdata}<extra></extra>',
-            customdata=hover_text
+        # Add bar chart for previous year's data
+        fig.add_trace(
+            go.Bar(
+                x=prev_year_dates,
+                y=prev_year_data,
+                name='Standard Lumber (Previous Year)',
+                marker_color='rgba(26, 26, 26, 0.3)',  # CN Black with transparency
+                hovertemplate='<b>Date</b>: %{x}<br>' +
+                             '<b>Previous Year Value</b>: %{y:.2f}<br><extra></extra>'
+            )
         )
-    )
+
+        # Add current year's actual data
+        current_data = df_last_year[df_last_year['Lumber'].notna()]
+        fig.add_trace(
+            go.Scatter(
+                x=current_data['Date'],
+                y=current_data['Lumber'],
+                name='Standard Lumber (Current)',
+                line=dict(color='#1A1A1A'),  # CN Black
+                hovertemplate='<b>Date</b>: %{x}<br>' +
+                             '<b>Current Value</b>: %{y:.2f}<br><extra></extra>'
+            )
+        )
+
+        # Add forecast data
+        forecast_data = df_last_year[df_last_year['Lumber_Forecast'].notna()]
+        
+        # Create hover text for forecast points with YoY change
+        hover_text = []
+        for idx, row in forecast_data.iterrows():
+            # Get previous year's value
+            prev_year_date = row['Date'] - pd.DateOffset(years=1)
+            prev_year_value = df[df['Date'] == prev_year_date]['Lumber'].values[0]
+            
+            # Calculate YoY change
+            yoy_change = ((row['Lumber_Forecast'] - prev_year_value) / prev_year_value) * 100
+            
+            # Get attribution scores
+            attribution_scores = {
+                f"Standard_Attribution_Indicator_{i}": row[f'Standard_Attribution_Indicator_{i}']
+                for i in range(1, 7)
+            }
+            top_3 = dict(sorted(attribution_scores.items(), key=lambda x: x[1], reverse=True)[:3])
+            
+            hover_str = f"<b>Date</b>: {row['Date'].strftime('%Y-%m-%d')}<br>"
+            hover_str += f"<b>Forecast</b>: {row['Lumber_Forecast']:.2f}<br>"
+            hover_str += f"<b>Previous Year</b>: {prev_year_value:.2f}<br>"
+            hover_str += f"<b>YoY Change</b>: {yoy_change:+.1f}%<br>"
+            hover_str += "<b>Top 3 Features:</b><br>"
+            for feature, score in top_3.items():
+                hover_str += f"- {feature}: {score:.3f}<br>"
+            hover_text.append(hover_str)
+
+        fig.add_trace(
+            go.Scatter(
+                x=forecast_data['Date'],
+                y=forecast_data['Lumber_Forecast'],
+                name='Standard Lumber (Forecast)',
+                line=dict(color='#CC0033', dash='dash'),  # CN Red
+                hovertemplate='%{customdata}<extra></extra>',
+                customdata=hover_text
+            )
+        )
+
+    if show_fancy:
+        # Add bars for previous year's data
+        prev_year_data = []
+        prev_year_dates = []
+        current_dates = df_last_year['Date'].tolist()
+        
+        for date in current_dates:
+            prev_year_date = date - pd.DateOffset(years=1)
+            prev_year_value = df[df['Date'] == prev_year_date]['Intermodal'].values
+            if len(prev_year_value) > 0:
+                prev_year_data.append(prev_year_value[0])
+                prev_year_dates.append(date)
+
+        # Add bar chart for previous year's data
+        fig.add_trace(
+            go.Bar(
+                x=prev_year_dates,
+                y=prev_year_data,
+                name='Intermodal (Previous Year)',
+                marker_color='rgba(102, 102, 102, 0.3)',  # CN Gray with transparency
+                hovertemplate='<b>Date</b>: %{x}<br>' +
+                             '<b>Previous Year Value</b>: %{y:.2f}<br><extra></extra>'
+            )
+        )
+
+        # Add current year's actual data
+        current_data = df_last_year[df_last_year['Intermodal'].notna()]
+        fig.add_trace(
+            go.Scatter(
+                x=current_data['Date'],
+                y=current_data['Intermodal'],
+                name='Intermodal (Current)',
+                line=dict(color='#666666'),  # CN Gray
+                hovertemplate='<b>Date</b>: %{x}<br>' +
+                             '<b>Current Value</b>: %{y:.2f}<br><extra></extra>'
+            )
+        )
+
+        # Add forecast data
+        forecast_data = df_last_year[df_last_year['Intermodal_Forecast'].notna()]
+        
+        # Create hover text for forecast points with YoY change
+        hover_text = []
+        for idx, row in forecast_data.iterrows():
+            # Get previous year's value
+            prev_year_date = row['Date'] - pd.DateOffset(years=1)
+            prev_year_value = df[df['Date'] == prev_year_date]['Intermodal'].values[0]
+            
+            # Calculate YoY change
+            yoy_change = ((row['Intermodal_Forecast'] - prev_year_value) / prev_year_value) * 100
+            
+            # Get attribution scores
+            attribution_scores = {
+                f"Fancy_Attribution_Indicator_{i}": row[f'Fancy_Attribution_Indicator_{i}']
+                for i in range(1, 7)
+            }
+            top_3 = dict(sorted(attribution_scores.items(), key=lambda x: x[1], reverse=True)[:3])
+            
+            hover_str = f"<b>Date</b>: {row['Date'].strftime('%Y-%m-%d')}<br>"
+            hover_str += f"<b>Forecast</b>: {row['Intermodal_Forecast']:.2f}<br>"
+            hover_str += f"<b>Previous Year</b>: {prev_year_value:.2f}<br>"
+            hover_str += f"<b>YoY Change</b>: {yoy_change:+.1f}%<br>"
+            hover_str += "<b>Top 3 Features:</b><br>"
+            for feature, score in top_3.items():
+                hover_str += f"- {feature}: {score:.3f}<br>"
+            hover_text.append(hover_str)
+
+        fig.add_trace(
+            go.Scatter(
+                x=forecast_data['Date'],
+                y=forecast_data['Intermodal_Forecast'],
+                name='Intermodal (Forecast)',
+                line=dict(color='#666666', dash='dash'),  # CN Gray
+                hovertemplate='%{customdata}<extra></extra>',
+                customdata=hover_text
+            )
+        )
 
     # Update layout with CN styling
     fig.update_layout(
         title={
-            'text': 'Historical Data and Forecast',
+            'text': 'Year-over-Year Comparison and Forecast',
             'font': {'color': '#1A1A1A', 'size': 24}
         },
         xaxis_title='Date',
@@ -187,13 +334,15 @@ def create_forecast_plot():
         xaxis=dict(
             gridcolor='#E5E5E5',
             showline=True,
-            linecolor='#E5E5E5'
+            linecolor='#E5E5E5',
+            range=[last_year_start, df['Date'].max()]  # Set x-axis range to last year + forecast
         ),
         yaxis=dict(
             gridcolor='#E5E5E5',
             showline=True,
             linecolor='#E5E5E5'
-        )
+        ),
+        barmode='overlay'  # This will make bars overlay with lines
     )
 
     return fig
@@ -205,21 +354,27 @@ st.plotly_chart(create_forecast_plot(), use_container_width=True)
 st.markdown('<p class="subtitle">Quarterly Forecasts</p>', unsafe_allow_html=True)
 col1, col2, col3 = st.columns(3)
 
-# Get forecast data
-forecast_df = df[df['Target_Forecast'].notna()].copy()
-forecast_df['Quarter'] = forecast_df['Date'].dt.quarter
-quarterly_forecasts = forecast_df.groupby('Quarter')['Target_Forecast'].first()
+# Get forecast data for both lumber types
+standard_forecast_df = df[df['Standard_Lumber_Forecast'].notna()].copy()
+fancy_forecast_df = df[df['Fancy_Lumber_Forecast'].notna()].copy()
+
+standard_forecast_df['Quarter'] = standard_forecast_df['Date'].dt.quarter
+fancy_forecast_df['Quarter'] = fancy_forecast_df['Date'].dt.quarter
+
+standard_quarterly_forecasts = standard_forecast_df.groupby('Quarter')['Standard_Lumber_Forecast'].first()
+fancy_quarterly_forecasts = fancy_forecast_df.groupby('Quarter')['Fancy_Lumber_Forecast'].first()
 
 # Get the generation date (latest date in our dataset)
 forecast_generation_date = df['Date'].max()
 
 # Display Q1 Forecast
 with col1:
-    if 1 in quarterly_forecasts.index:
+    if 1 in standard_quarterly_forecasts.index or 1 in fancy_quarterly_forecasts.index:
         st.markdown(
             f"""<div class="metric-container">
                 <h3 style="color: #1A1A1A; margin: 0;">Q1 Forecast</h3>
-                <p style="color: #CC0033; font-size: 24px; margin: 0;">{quarterly_forecasts[1]:.2f}</p>
+                {f'<p style="color: #CC0033; font-size: 24px; margin: 0;">Standard: {standard_quarterly_forecasts[1]:.2f}</p>' if show_standard and 1 in standard_quarterly_forecasts.index else ''}
+                {f'<p style="color: #666666; font-size: 24px; margin: 0;">Fancy: {fancy_quarterly_forecasts[1]:.2f}</p>' if show_fancy and 1 in fancy_quarterly_forecasts.index else ''}
                 <p style="color: #666666; font-size: 14px; margin: 0;">
                     Generated: {forecast_generation_date.strftime('%Y-%m-%d')}
                 </p>
@@ -229,11 +384,12 @@ with col1:
 
 # Display Q2 Forecast
 with col2:
-    if 2 in quarterly_forecasts.index:
+    if 2 in standard_quarterly_forecasts.index or 2 in fancy_quarterly_forecasts.index:
         st.markdown(
             f"""<div class="metric-container">
                 <h3 style="color: #1A1A1A; margin: 0;">Q2 Forecast</h3>
-                <p style="color: #CC0033; font-size: 24px; margin: 0;">{quarterly_forecasts[2]:.2f}</p>
+                {f'<p style="color: #CC0033; font-size: 24px; margin: 0;">Standard: {standard_quarterly_forecasts[2]:.2f}</p>' if show_standard and 2 in standard_quarterly_forecasts.index else ''}
+                {f'<p style="color: #666666; font-size: 24px; margin: 0;">Fancy: {fancy_quarterly_forecasts[2]:.2f}</p>' if show_fancy and 2 in fancy_quarterly_forecasts.index else ''}
                 <p style="color: #666666; font-size: 14px; margin: 0;">
                     Generated: {forecast_generation_date.strftime('%Y-%m-%d')}
                 </p>
@@ -243,11 +399,12 @@ with col2:
 
 # Display Q3 Forecast
 with col3:
-    if 3 in quarterly_forecasts.index:
+    if 3 in standard_quarterly_forecasts.index or 3 in fancy_quarterly_forecasts.index:
         st.markdown(
             f"""<div class="metric-container">
                 <h3 style="color: #1A1A1A; margin: 0;">Q3 Forecast</h3>
-                <p style="color: #CC0033; font-size: 24px; margin: 0;">{quarterly_forecasts[3]:.2f}</p>
+                {f'<p style="color: #CC0033; font-size: 24px; margin: 0;">Standard: {standard_quarterly_forecasts[3]:.2f}</p>' if show_standard and 3 in standard_quarterly_forecasts.index else ''}
+                {f'<p style="color: #666666; font-size: 24px; margin: 0;">Fancy: {fancy_quarterly_forecasts[3]:.2f}</p>' if show_fancy and 3 in fancy_quarterly_forecasts.index else ''}
                 <p style="color: #666666; font-size: 14px; margin: 0;">
                     Generated: {forecast_generation_date.strftime('%Y-%m-%d')}
                 </p>
